@@ -1,0 +1,1 @@
+{"source_to_center_dst": 1000, "source_to_detector_dst": 1500, "det_offset": 0, "vol_dims": [256, 256, 256], "det_dims": [256, 256], "det_spacing": [2, 2], "vol_spacing": [2, 2, 2], "sampling_step_size": 0.5}
