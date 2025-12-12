@@ -2,10 +2,14 @@
 import logging
 import os
 import pdb
+import subprocess as sp
 
 # time management
 # time management
 import time
+
+# partial
+from functools import partial
 from pathlib import Path
 
 import hydra
@@ -20,37 +24,29 @@ import torch.nn.functional as F
 # Logging
 # Logging
 import wandb
+
+# Nefs
+from nef import get_neural_field
+from nn_utils.checkpointer import CheckpointMaker
+from nn_utils.early_stopping import EarlyStopping
+from nn_utils.loggers import MultiCBCTLogger, MultiCBCTReconLogger
+from nn_utils.optimizers import get_optimizer
 from omegaconf import OmegaConf
+from rendering.rendering import ConebeamRenderer
 
 # Dataset
 # from ct_dataset import CTDataset
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from dataset.cbct_recon_dataset import MultiVolumeConebeamReconDataset
-from dataset.cbct_dataset import MultiVolumeConebeamDataset
-
-# Nefs
-from nef import get_neural_field
-from nn_utils.checkpointer import CheckpointMaker
-from nn_utils.loggers import MultiCBCTReconLogger, MultiCBCTLogger
-from nn_utils.early_stopping import EarlyStopping
-from nn_utils.optimizers import get_optimizer
-
-from rendering.rendering import ConebeamRenderer
-
 from dataset import get_dataloader
-
-# partial
-from functools import partial
-import subprocess as sp
+from dataset.cbct_dataset import MultiVolumeConebeamDataset
+from dataset.cbct_recon_dataset import MultiVolumeConebeamReconDataset
 
 log = logging.getLogger(__name__)
 
 
-@hydra.main(
-    config_path="../config", config_name="recon_pretraining.yaml", version_base=None
-)
+@hydra.main(config_path="../config", config_name="recon_pretraining.yaml", version_base=None)
 def main(cfg):
     experiment_path = Path(os.getcwd())
     log.info("Experiment path: {}".format(experiment_path))
@@ -83,9 +79,7 @@ def main(cfg):
         if not cfg.load_config:
             log.info("load_config is set to False, so we overwrite the config file.")
         elif not cfg_path.exists():
-            log.info(
-                "No hydra config file found. Using provided config and storing it."
-            )
+            log.info("No hydra config file found. Using provided config and storing it.")
 
         # store hydra config
         with open("hydra_config.yaml", "w") as f:
@@ -128,9 +122,7 @@ def main(cfg):
     log.info(f"Number of parameters: {sum([p.numel() for p in model.parameters()])}. ")
 
     logger = MultiCBCTReconLogger(train_loader.dataset, cfg.log_steps)
-    checkpointer = CheckpointMaker(
-        experiment_path / "checkpoints", cfg.training.checkpoint_steps
-    )
+    checkpointer = CheckpointMaker(experiment_path / "checkpoints", cfg.training.checkpoint_steps)
     if cfg.load_weights:
         checkpointer.load_best_checkpoint(model)
     if cfg.training.do:
@@ -150,16 +142,12 @@ def main(cfg):
     for i, p in enumerate(model.conditioning.codes):
         if i != cfg.val_dataset.volume_id:
             p.to("cpu")
-    log.info(
-        f"Used GPU memory after unloading part of the model: {torch.cuda.memory_allocated()}."
-    )
+    log.info(f"Used GPU memory after unloading part of the model: {torch.cuda.memory_allocated()}.")
     log.info(f"Number of parameters: {sum([p.numel() for p in model.parameters()])}. ")
     model = model.to(device)
 
     logger = MultiCBCTReconLogger(train_loader.dataset, cfg.log_steps)
-    checkpointer = CheckpointMaker(
-        experiment_path / "checkpoints", cfg.training.checkpoint_steps
-    )
+    checkpointer = CheckpointMaker(experiment_path / "checkpoints", cfg.training.checkpoint_steps)
 
     ##############
     # Validation #
@@ -178,9 +166,7 @@ def main(cfg):
         checkpointer.load_best_checkpoint(model)
 
         cfg.val_dataset.volume_id = patient
-        val_loader = get_dataloader(
-            cfg.val_dataset, cfg.validation, cfg.val_dataset.stage
-        )
+        val_loader = get_dataloader(cfg.val_dataset, cfg.validation, cfg.val_dataset.stage)
         val_logger = MultiCBCTLogger(
             val_loader.dataset,
             cfg.log_steps,
@@ -322,9 +308,7 @@ def train(
             # second_scheduler.step(loss)
 
             logger.train_step(model, loss)
-            checkpointer.step(
-                model, optimizers[0], loss.detach(), metric=-logger.best_psnr
-            )
+            checkpointer.step(model, optimizers[0], loss.detach(), metric=-logger.best_psnr)
 
             # elapsed time in seconds
             elapsed_time = time.time() - start_time
@@ -349,9 +333,7 @@ def validate(
     model.train()
     optimizer = get_optimizer(
         optimizer_config=optimizer_cfg,
-        parameters=model.conditioning.codes[
-            val_loader.dataset.volume_id + 200
-        ].parameters(),
+        parameters=model.conditioning.codes[val_loader.dataset.volume_id + 200].parameters(),
         lr=validation_cfg.lr,
     )
 

@@ -1,18 +1,16 @@
+import argparse
 import json
 import logging
+import os
 from glob import glob
 from pathlib import Path
 
 import h5py
 import numpy as np
 import torch
+from rendering.rendering import ConebeamRenderer
 from tomo_projector_utils.scanner import ConebeamGeometry
 from tqdm import tqdm
-
-import os
-import argparse
-
-from rendering.rendering import ConebeamRenderer
 
 log = logging.getLogger(__name__)
 
@@ -57,9 +55,7 @@ if __name__ == "__main__":
     # parse arguments
     parser = argparse.ArgumentParser()
     parser.add_argument("--volumes_dir", type=str, default="../data/volumes")
-    parser.add_argument(
-        "--recons_dir", type=str, default="../data/volumes_recon_pretraining"
-    )
+    parser.add_argument("--recons_dir", type=str, default="../data/volumes_recon_pretraining")
     args = parser.parse_args()
 
     proj_name = "projections"
@@ -68,9 +64,7 @@ if __name__ == "__main__":
     renderers = []
     angles = []
 
-    rendering_bbox = torch.tensor(
-        [[-400, -400, -400], [400, 400, 400]], dtype=torch.float32
-    )
+    rendering_bbox = torch.tensor([[-400, -400, -400], [400, 400, 400]], dtype=torch.float32)
 
     volume_dir = args.volumes_dir
     # select the correct subset of volumes
@@ -89,9 +83,7 @@ if __name__ == "__main__":
         angles.append(f["angles"][:400:8])
 
         geometry_path = Path(volume_path) / "geometry.json"
-        geometries.append(
-            ConebeamGeometry.from_json(geometry_path, device=torch.device("cpu"))
-        )
+        geometries.append(ConebeamGeometry.from_json(geometry_path, device=torch.device("cpu")))
         geom = geometries[-1]
         geom.update_angles(angles[-1])
 
@@ -109,14 +101,10 @@ if __name__ == "__main__":
         volume = get_volume(patient_idx)
 
         # Create h5py file for the volume
-        new_file = h5py.File(
-            Path(args.recons_dir) / f"volume_grid_{patient_idx}.h5", "w"
-        )
+        new_file = h5py.File(Path(args.recons_dir) / f"volume_grid_{patient_idx}.h5", "w")
 
         # Create dataset for the volume
-        volume_dataset = new_file.create_dataset(
-            "volume", shape=volume.shape, dtype=np.float32
-        )
+        volume_dataset = new_file.create_dataset("volume", shape=volume.shape, dtype=np.float32)
         volume_dataset[:] = volume
 
         # Create dataset for the reference coordinates
