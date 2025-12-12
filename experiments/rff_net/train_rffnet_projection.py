@@ -1,3 +1,4 @@
+import logging
 import os
 import sys
 import time
@@ -16,13 +17,14 @@ from tqdm import tqdm
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 
 from dataset.load_slices import get_slice_dataloader
-from experiments.rff_net.rendering import (
+from metrics import psnr
+from models.rff_net import RFFNet
+from rendering import (
+    ImageModel,
     get_parallel_rays_2d,
     get_ray_aabb_intersection_2d,
     render_parallel_projection,
 )
-from metrics import psnr
-from models.rff_net import RFFNet
 
 FLAGS = flags.FLAGS
 
@@ -34,64 +36,14 @@ config_flags.DEFINE_config_file(
 )
 
 
-class ImageModel(torch.nn.Module):
-    """
-    Wraps a 2D image tensor to act as a 'function' for ray tracing.
-    Input: (x, y) coordinates in [-1, 1].
-    Output: Interpolated pixel values.
-    """
-
-    def __init__(self, image, aabb_min, aabb_max):
-        super().__init__()
-        # image: [1, 1, H, W]
-        self.register_buffer("image", image)
-        self.register_buffer("aabb_min", aabb_min)
-        self.register_buffer("aabb_max", aabb_max)
-
-    def forward(self, x):
-        # x: [B, 2] or [B, P, S, 2] -> needs [N, 1, 1, 2] for grid_sample
-        # grid_sample expects [N, C, H_in, W_in] input and [N, H_out, W_out, 2] grid
-
-        orig_shape = x.shape
-        # Flatten to [1, N, 1, 2] where N is total points
-        # grid_sample grids are [N, H, W, 2]
-
-        # We treat the batch of query points as a "image" of size 1xN per batch?
-        # Simpler:
-        # grid: [1, 1, TotalPoints, 2]
-        # output: [1, C, 1, TotalPoints]
-
-        x_flat = x.reshape(1, 1, -1, 2)
-
-        # Normalize from [aabb_min, aabb_max] to [-1, 1]
-        # x_norm = 2 * (x - min) / (max - min) - 1
-        aabb_min = self.aabb_min.reshape(1, 1, 1, 2)
-        aabb_max = self.aabb_max.reshape(1, 1, 1, 2)
-
-        x_norm = 2.0 * (x_flat - aabb_min) / (aabb_max - aabb_min) - 1.0
-
-        # grid_sample coordinates: -1=left/top, 1=right/bottom
-        # We assume x comes in standard cartesian [-1, 1].
-
-        out = F.grid_sample(
-            self.image, x_norm, align_corners=True, mode="bilinear", padding_mode="zeros"
-        )
-        # out: [1, 1, 1, TotalPoints]
-
-        return out.reshape(
-            orig_shape[:-1]
-        )  # Remove last dim 2, return [..., 1] implicitly squeezed?
-        # The rendering function expects output [B, P, S] or [..., 1]
-
-        # reshape returns [B, P, S] (if input was that)
-        return out.view(orig_shape[:-1])
-
-
 def train(argv):
     config = FLAGS.config
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+
+    # Setup logging before anything else
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
 
     # Experiment setup
     experiment_root = Path(config.experiment_root)
@@ -99,6 +51,22 @@ def train(argv):
     wandb.init(project=config.wandb.project_name, config=config, dir=str(experiment_root))
     experiment_dir = experiment_root / wandb.run.id
     experiment_dir.mkdir(parents=True, exist_ok=True)
+
+    # Configure logging to file and console
+    log_file = experiment_dir / "training.log"
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(logging.INFO)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    file_handler.setFormatter(formatter)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+    logger.info(f"Using device: {device}")
+    logger.info(f"Experiment directory: {experiment_dir}")
+    logger.info(f"Logging to: {log_file}")
 
     # --- 1. Load Ground Truth Data ---
     full_dataset = get_slice_dataloader(
@@ -113,14 +81,13 @@ def train(argv):
     target_slice_idx = config.slice_idx if config.slice_idx < len(full_dataset) else 0
     sample = full_dataset[target_slice_idx]
     gt_image = sample["image"].unsqueeze(0).to(device)  # [1, H, W]
-    coords = sample["coords"].unsqueeze(0).to(device)  # [1, H, W, 2]
     vol_bbox = sample["vol_bbox"]
 
     # Ensure shape for grid_sample: [1, 1, H, W]
     if gt_image.dim() == 3:
         gt_image = gt_image.unsqueeze(0)
 
-    print(f"Loaded GT Image: {gt_image.shape}")
+    logger.info(f"Loaded GT Image: {gt_image.shape}")
 
     # --- 2. Generate Ground Truth Projections (Sinogram) ---
     # Define Projection Geometry
@@ -158,8 +125,8 @@ def train(argv):
     diag = torch.norm(aabb_max - aabb_min).item()
     detector_width = diag * 1.5
 
-    print(f"Generating Sinogram: {num_angles} angles, {num_det_pixels} pixels")
-    print(f"AABB: {aabb_min.cpu().numpy()} to {aabb_max.cpu().numpy()}")
+    logger.info(f"Generating Sinogram: {num_angles} angles, {num_det_pixels} pixels")
+    logger.info(f"AABB: {aabb_min.cpu().numpy()} to {aabb_max.cpu().numpy()}")
 
     # Create wrapper model for GT generation
     gt_model = ImageModel(gt_image, aabb_min, aabb_max)
@@ -220,7 +187,7 @@ def train(argv):
 
     batch_size_angles = config.batch_size_angles  # Train on subset of views per step
 
-    print("Starting training...")
+    logger.info("Starting training...")
     iter_per_epoch = max(1, num_angles // batch_size_angles)
 
     pbar = tqdm(range(config.epochs), desc="Training")
