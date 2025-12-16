@@ -151,3 +151,4 @@ Thumbs.db
 # output/
 results/
 *.npy
+data/

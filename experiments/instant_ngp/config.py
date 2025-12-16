@@ -12,7 +12,7 @@ def get_config():
     config.gray_value_scaling = 20.0
 
     # Training params
-    config.epochs = 1000
+    config.epochs = 5000
     config.experiment_root = "/home/samuele/code/cbct_torch/results/latent_transformer"
     config.val_interval = 100
     # Accumulate gradients across this many micro-batches before an optimizer
@@ -35,7 +35,7 @@ def get_config():
     # Meta-learning params
     config.inner_steps = 3  # SGD steps for latent optimization
     config.inner_lr = 0.01  # Learning rate for latent SGD
-    config.outer_lr = 0.005  # Learning rate for transformer Adam
+    config.outer_lr = 0.01  # Learning rate for transformer Adam
     config.warmup_epochs = 50  # Number of epochs for learning rate warmup
 
     # Stability params
@@ -49,7 +49,7 @@ def get_config():
     config.num_samples = 256  # Integration steps for rendering
     config.num_samples_gt = 256  # Integration steps for GT generation
     config.num_angles = 400  # Total views in sinogram
-    config.batch_size_angles = 16  # Views per step
+    config.batch_size_angles = 400  # Views per step
 
     # Fitting mode: 'projection' or 'image'
     # 'projection': fit to sinogram projections (current method)

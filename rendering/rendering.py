@@ -108,7 +108,7 @@ def _normalize_to_aabb(pts, aabb_min, aabb_max):
     aabb_min = aabb_min.view(*([1] * (pts.ndim - 1)), 2)
     aabb_max = aabb_max.view(*([1] * (pts.ndim - 1)), 2)
 
-    return 2.0 * (pts - aabb_min) / (aabb_max - aabb_min) - 1.0
+    return (pts - aabb_min) / (aabb_max - aabb_min)
 
 
 def render_parallel_projection(
@@ -277,9 +277,9 @@ def render_parallel_projection(
 
 # Try to create a compiled version of the integrator for speed (PyTorch 2.x).
 # Falls back gracefully if torch.compile is unavailable (older PyTorch).
-try:
-    render_parallel_projection = torch.compile(render_parallel_projection)  # type: ignore[attr-defined]
-except (AttributeError, RuntimeError):
-    # AttributeError: torch.compile not present (older PyTorch).
-    # RuntimeError: backend not available / unsupported environment.
-    pass
+# try:
+#     render_parallel_projection = torch.compile(render_parallel_projection)  # type: ignore[attr-defined]
+# except (AttributeError, RuntimeError):
+#     # AttributeError: torch.compile not present (older PyTorch).
+#     # RuntimeError: backend not available / unsupported environment.
+#     pass

@@ -23,11 +23,9 @@ class ImageModel(torch.nn.Module):
         orig_shape = x.shape
         x_flat = x.reshape(1, 1, -1, 2)
 
-        # grid_sample coordinates: -1=left/top, 1=right/bottom
+        # map [0, 1] to [-1, 1]
+        x_flat = 2 * x_flat - 1
         out = F.grid_sample(
             self.image, x_flat, align_corners=True, mode="bilinear", padding_mode="zeros"
         )
-        # out: [1, 1, 1, TotalPoints]
-
-        # Remove last dim 2, return [...] with original batch dims
         return out.view(orig_shape[:-1])

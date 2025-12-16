@@ -1,7 +1,4 @@
-import logging
-import os
 import sys
-import time
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -20,15 +17,10 @@ sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 import tinycudann as tcnn
 
 from dataset.load_slices import get_slice_dataloader
-from experiments.instant_ngp.model import (
-    HashGridEncoder,
-    HashLatentField,
-    HashLatentMLP,
-    HashLatentTransformer,
-)
 from metrics import psnr
 from rendering import (
     ImageModel,
+    _normalize_to_aabb,
     get_parallel_rays_2d,
     get_ray_aabb_intersection_2d,
     render_parallel_projection,
@@ -187,7 +179,7 @@ def train(argv):
 
     # Detector setup
     H, W = gt_image.shape[-2:]
-    num_det_pixels = max(H, W)
+    # num_det_pixels = max(H, W)
 
     # Use AABB intersection for rays
     # Use vol_bbox from sample to define physical extent
@@ -208,6 +200,7 @@ def train(argv):
     # Calculate diagonal of actual AABB
     diag = torch.norm(aabb_max - aabb_min).item()
     detector_width = diag * 1.0
+    num_det_pixels = int(np.ceil(np.sqrt(H**2 + W**2)))
 
     logger.info(f"Generating Sinogram: {num_angles} angles, {num_det_pixels} pixels")
     logger.info(f"AABB: {aabb_min.cpu().numpy()} to {aabb_max.cpu().numpy()}")
@@ -220,10 +213,118 @@ def train(argv):
 
     # Compute AABB intersections for GT
     t_min, t_max, hits = get_ray_aabb_intersection_2d(rays_o_all, rays_d_all, aabb_min, aabb_max)
-    hits_mask = hits.squeeze(-1)
-    # Only integrate over ray segments that actually pass through the image
-    t_min = torch.where(hits, t_min.clamp_min(0.0), torch.zeros_like(t_min))
-    t_max = torch.where(hits, t_max.clamp_min(0.0), torch.zeros_like(t_max))
+
+    # Ensure valid segments before passing to the renderer:
+    # - order them so near <= far
+    # - require finite values
+    # - require strictly positive length (far > near)
+    t_near = torch.minimum(t_min, t_max)
+    t_far = torch.maximum(t_min, t_max)
+
+    is_finite = torch.isfinite(t_near) & torch.isfinite(t_far)
+    has_length = t_far > (t_near + 1e-6)
+
+    valid = hits & is_finite & has_length
+    hits_mask = valid.squeeze(-1)
+
+    # For invalid rays, set a dummy [0, 0] segment; they will be ignored via hits_mask.
+    t_min = torch.where(valid, t_near, torch.zeros_like(t_near))
+    t_max = torch.where(valid, t_far, torch.zeros_like(t_far))
+
+    # --- Debug visualization: sample a larger set of rays and their 2D points ---
+    # Select a set of angles and detector pixels to visualize.
+    num_debug_angles = min(16, num_angles)
+    num_debug_det = min(32, num_det_pixels)
+
+    angle_indices_dbg = torch.linspace(
+        0, num_angles - 1, steps=num_debug_angles, device=device
+    ).long()
+    det_indices_dbg = torch.linspace(
+        0, num_det_pixels - 1, steps=num_debug_det, device=device
+    ).long()
+
+    # Use the same sampling strategy as in render_parallel_projection (deterministic)
+    steps_dbg = torch.linspace(0, 1, config.num_samples_gt, device=device).view(
+        1, 1, config.num_samples_gt
+    )
+
+    ray_points_world = []
+    ray_points_norm = []
+
+    for ai in angle_indices_dbg:
+        for di in det_indices_dbg:
+            if not hits_mask[ai, di]:
+                continue
+
+            ro = rays_o_all[ai, di]  # [2]
+            rd = rays_d_all[ai, di]  # [2]
+            t0 = t_min[ai, di]  # [1]
+            t1 = t_max[ai, di]  # [1]
+
+            # Sample along this ray segment
+            z_vals_dbg = t0 + steps_dbg.squeeze(0).squeeze(0) * (t1 - t0)  # [S]
+            pts_dbg = ro.unsqueeze(0) + rd.unsqueeze(0) * z_vals_dbg.unsqueeze(-1)  # [S, 2]
+
+            # Normalize to model input space [-1, 1]
+            pts_norm_dbg = _normalize_to_aabb(pts_dbg, aabb_min, aabb_max)  # [S, 2]
+
+            ray_points_world.append(pts_dbg.detach().cpu().numpy())
+            ray_points_norm.append(pts_norm_dbg.detach().cpu().numpy())
+
+    if ray_points_world:
+        # Concatenate for scatter plotting
+        world_concat = np.concatenate(ray_points_world, axis=0)  # [N, 2] (y, x)
+        norm_concat = np.concatenate(ray_points_norm, axis=0)  # [N, 2] (x, y) in [-1,1]
+
+        # Optionally subsample if too many points
+        max_points = 5000
+        if world_concat.shape[0] > max_points:
+            idx = np.random.choice(world_concat.shape[0], size=max_points, replace=False)
+            world_concat = world_concat[idx]
+            norm_concat = norm_concat[idx]
+
+        # Plot world-space rays over the GT image and normalized coordinates separately.
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+        # Left: GT image with ray samples in world coordinates (scatter)
+        axes[0].imshow(
+            gt_image[0, 0].detach().cpu().numpy(),
+            cmap="gray",
+            extent=[
+                aabb_min[1].item(),
+                aabb_max[1].item(),
+                aabb_min[0].item(),
+                aabb_max[0].item(),
+            ],
+            origin="lower",
+        )
+        axes[0].scatter(
+            world_concat[:, 1],
+            world_concat[:, 0],
+            s=4,
+            c="red",
+            alpha=0.4,
+        )
+        axes[0].set_title("Ray samples in world space")
+        axes[0].set_xlim(aabb_min[1].item(), aabb_max[1].item())
+        axes[0].set_ylim(aabb_min[0].item(), aabb_max[0].item())
+
+        # Right: normalized coordinates that go into the model (scatter)
+        axes[1].set_aspect("equal")
+        axes[1].scatter(
+            norm_concat[:, 0],
+            norm_concat[:, 1],
+            s=4,
+            c="blue",
+            alpha=0.4,
+        )
+        axes[1].set_title("Ray samples in normalized space (model input)")
+        axes[1].set_xlim(-1.1, 1.1)
+        axes[1].set_ylim(-1.1, 1.1)
+
+        plt.tight_layout()
+        plt.savefig(experiment_dir / "ray_sampling_debug.png")
+        plt.close(fig)
 
     # Render GT sinogram (raw physical units)
     gt_sinogram = render_parallel_projection(
@@ -298,6 +399,9 @@ def train(argv):
         )
 
     # --- 3. Initialize Model ---
+    # Standard Instant-NGP style hash-encoded MLP (no latents / meta-learning).
+    # Force float32 for both encoding and network to avoid Half/Float mismatches
+    # in tiny-cuda-nn custom kernels.
     model = tcnn.NetworkWithInputEncoding(
         n_input_dims=2,
         n_output_dims=1,
@@ -305,10 +409,11 @@ def train(argv):
             "otype": "HashGrid",
             "n_levels": 16,
             "n_features_per_level": 2,
-            "log2_hashmap_size": 15,
+            "log2_hashmap_size": 14,
             "base_resolution": 16,
             "per_level_scale": 1.5,
             "fixed_point_pos": False,
+            "dtype": "float32",
         },
         network_config={
             "otype": "FullyFusedMLP",
@@ -316,223 +421,48 @@ def train(argv):
             "output_activation": "None",
             "n_neurons": 64,
             "n_hidden_layers": 2,
+            "dtype": "float32",
         },
     ).to(device)
-
-    num_params = sum(p.numel() for p in model.parameters())
-    logger.info(f"Model parameters: {num_params:,}")
-
-    # Determine training mode
-    training_mode = getattr(config, "training_mode", "meta_learning")
-    logger.info(f"Training mode: {training_mode}")
-
-    # Initialize latents for joint optimization mode (persist across epochs)
-    if training_mode == "joint":
-        joint_latents = model.init_latents(device=device)
-        joint_latents.requires_grad = True
-        # Optimizer includes both model and latents
-        outer_optimizer = torch.optim.Adam(
-            list(model.parameters()) + [joint_latents], lr=config.outer_lr
-        )
-        logger.info("Joint optimization mode: optimizing model and latents together")
-    else:
-        # Meta-learning mode: only optimize model parameters
-        outer_optimizer = torch.optim.Adam(model.parameters(), lr=config.outer_lr)
-        joint_latents = None
 
     # --- 4. Training Loop ---
     batch_size_angles = config.batch_size_angles
     grad_accum_steps = getattr(config, "grad_accum_steps", 1)
 
     logger.info("Starting training...")
+    # Number of angle batches per epoch (for potential scheduling/diagnostics)
     iter_per_epoch = max(1, num_angles // batch_size_angles)
+    _ = iter_per_epoch
 
     # Pre-generate validation grid for image reconstruction
     # Grid in world/AABB coordinates
+    pixel_size_w = (aabb_max[1].item() - aabb_min[1].item()) / W
+    pixel_size_h = (aabb_max[0].item() - aabb_min[0].item()) / H
     y_g, x_g = torch.meshgrid(
-        torch.linspace(aabb_min[0].item(), aabb_max[0].item(), H, device=device),
-        torch.linspace(aabb_min[1].item(), aabb_max[1].item(), W, device=device),
+        torch.linspace(
+            aabb_min[0].item() + pixel_size_h / 2,
+            aabb_max[0].item() - pixel_size_h / 2,
+            H,
+            device=device,
+        ),
+        torch.linspace(
+            aabb_min[1].item() + pixel_size_w / 2,
+            aabb_max[1].item() - pixel_size_w / 2,
+            W,
+            device=device,
+        ),
         indexing="xy",
     )
     grid_coords_world = torch.stack([y_g, x_g], dim=-1).reshape(-1, 2)  # [H*W, 2]
 
     # Normalize grid to [-1, 1] using the same AABB normalization as ray sampling
-    grid_coords = 2.0 * (grid_coords_world - aabb_min) / (aabb_max - aabb_min) - 1.0
+    grid_coords = _normalize_to_aabb(grid_coords_world, aabb_min, aabb_max)
 
-    def run_inner_loop(
-        model,
-        latents,
-        num_steps,
-        inner_lr,
-        rays_o_all,
-        rays_d_all,
-        t_min,
-        t_max,
-        hits_mask,
-        gt_sinogram,
-        num_angles,
-        batch_size_angles,
-        num_samples,
-        device,
-        log_stats=False,
-        fitting_mode="projection",
-        gt_image=None,
-        grid_coords=None,
-        grad_clip_norm=None,
-        latent_clip_value=None,
-        loss_clip_max=None,
-        check_nan=False,
-    ):
-        """
-        Run inner loop to optimize latents.
+    num_params = sum(p.numel() for p in model.parameters())
+    logger.info(f"Model parameters: {num_params:,}")
 
-        Args:
-            model: LatentTransformer model
-            latents: Initial latents tensor [1, num_latents, latent_dim]
-            num_steps: Number of inner loop steps
-            rays_o_all: All ray origins
-            rays_d_all: All ray directions
-            t_min: Near bounds for all rays
-            t_max: Far bounds for all rays
-            gt_sinogram: Ground truth sinogram
-            num_angles: Total number of angles
-            batch_size_angles: Batch size for angle sampling
-            num_samples: Number of samples for rendering
-            device: Device to use
-            log_stats: Whether to log detailed statistics
-            fitting_mode: 'projection' or 'image'
-            gt_image: Ground truth image (required if fitting_mode='image')
-            grid_coords: Grid coordinates (required if fitting_mode='image')
-
-        Returns:
-            optimized_latents: Optimized latents
-            losses: List of losses for each step
-        """
-        inner_optimizer = torch.optim.SGD([latents], lr=inner_lr)
-
-        losses = []
-        stats = {}
-
-        for inner_step in range(num_steps):
-            inner_optimizer.zero_grad()
-
-            if fitting_mode == "projection":
-                # Projection-based fitting (original method)
-                # Sample random angles
-                angle_indices = torch.randperm(num_angles, device=device)[:batch_size_angles]
-                rays_o_batch = rays_o_all[angle_indices]
-                rays_d_batch = rays_d_all[angle_indices]
-                t_min_batch = t_min[angle_indices]
-                t_max_batch = t_max[angle_indices]
-                hits_batch = hits_mask[angle_indices]
-                gt_sino_batch = gt_sinogram[angle_indices]
-
-                # Forward pass
-                def model_fn(x):
-                    return model(x, latents)
-
-                pred_proj = render_parallel_projection(
-                    model_fn,
-                    rays_o_batch,
-                    rays_d_batch,
-                    near=t_min_batch,
-                    far=t_max_batch,
-                    num_samples=num_samples,
-                    rand=False,
-                    aabb_min=aabb_min,
-                    aabb_max=aabb_max,
-                    hits_mask=hits_batch,
-                )
-                pred_proj = (pred_proj - sino_center) / sino_half_range
-                loss = compute_loss(pred_proj, gt_sino_batch, is_image=False)
-
-                # Stability: Clip loss value
-                if loss_clip_max is not None:
-                    loss = torch.clamp(loss, max=loss_clip_max)
-
-                # Log statistics on first step
-                if log_stats and inner_step == 0:
-                    with torch.no_grad():
-                        stats["pred_proj_min"] = pred_proj.min().item()
-                        stats["pred_proj_max"] = pred_proj.max().item()
-                        stats["pred_proj_mean"] = pred_proj.mean().item()
-                        stats["pred_proj_std"] = pred_proj.std().item()
-                        stats["gt_sino_min"] = gt_sino_batch.min().item()
-                        stats["gt_sino_max"] = gt_sino_batch.max().item()
-                        stats["gt_sino_mean"] = gt_sino_batch.mean().item()
-                        stats["gt_sino_std"] = gt_sino_batch.std().item()
-
-            elif fitting_mode == "image":
-                # Direct image fitting
-                # Forward pass on grid coordinates
-                pred_image_flat = model(grid_coords, latents)  # [H*W, 1]
-                pred_image = pred_image_flat.reshape(gt_image.shape)  # [1, 1, H, W]
-                loss = compute_loss(pred_image, gt_image, is_image=True)
-
-                # Stability: Clip loss value
-                if loss_clip_max is not None:
-                    loss = torch.clamp(loss, max=loss_clip_max)
-
-                # Log statistics on first step
-                if log_stats and inner_step == 0:
-                    with torch.no_grad():
-                        stats["pred_image_min"] = pred_image.min().item()
-                        stats["pred_image_max"] = pred_image.max().item()
-                        stats["pred_image_mean"] = pred_image.mean().item()
-                        stats["pred_image_std"] = pred_image.std().item()
-                        stats["gt_image_min"] = gt_image.min().item()
-                        stats["gt_image_max"] = gt_image.max().item()
-                        stats["gt_image_mean"] = gt_image.mean().item()
-                        stats["gt_image_std"] = gt_image.std().item()
-            else:
-                raise ValueError(f"Unknown fitting_mode: {fitting_mode}")
-
-            losses.append(loss.item())
-
-            # Log latent statistics on first step
-            if log_stats and inner_step == 0:
-                with torch.no_grad():
-                    stats["latents_norm"] = latents.norm().item()
-                    stats["latents_mean"] = latents.mean().item()
-                    stats["latents_std"] = latents.std().item()
-
-            loss.backward()
-
-            # Stability: Check for NaN/Inf
-            if check_nan:
-                if torch.isnan(loss) or torch.isinf(loss):
-                    logger.warning(
-                        f"NaN/Inf loss detected at inner step {inner_step}, skipping update"
-                    )
-                    inner_optimizer.zero_grad()
-                    continue
-                if latents.grad is not None:
-                    if torch.isnan(latents.grad).any() or torch.isinf(latents.grad).any():
-                        logger.warning(
-                            f"NaN/Inf gradients detected at inner step {inner_step}, skipping update"
-                        )
-                        inner_optimizer.zero_grad()
-                        continue
-
-            # Stability: Gradient clipping for latents
-            if latents.grad is not None and grad_clip_norm is not None:
-                torch.nn.utils.clip_grad_norm_([latents], grad_clip_norm)
-
-            # Log gradient statistics
-            if log_stats and inner_step == 0:
-                if latents.grad is not None:
-                    stats["latents_grad_norm"] = latents.grad.norm().item()
-                    stats["latents_grad_mean"] = latents.grad.mean().item()
-                    stats["latents_grad_max"] = latents.grad.abs().max().item()
-
-            inner_optimizer.step()
-
-            # Stability: Clip latent values
-            if latent_clip_value is not None:
-                with torch.no_grad():
-                    latents.clamp_(-latent_clip_value, latent_clip_value)
-
-        return latents, losses, stats if log_stats else {}
+    # Simple optimizer over model parameters only.
+    outer_optimizer = torch.optim.Adam(model.parameters(), lr=config.outer_lr)
 
     pbar = tqdm(range(config.epochs), desc="Training")
 
@@ -550,95 +480,8 @@ def train(argv):
             for param_group in outer_optimizer.param_groups:
                 param_group["lr"] = config.outer_lr
 
-        # Initialize or use latents based on training mode
-        if training_mode == "joint":
-            # Use persistent latents in joint mode
-            latents = joint_latents
-            inner_losses = []
-            inner_stats = {}
-        else:
-            # Meta-learning mode: initialize new latents each epoch
-            latents = model.init_latents(device=device)
-            latents.requires_grad = True
-
-            # Inner loop: Optimize latents with SGD (first-order approximation)
-            # Log detailed stats every 10 epochs
-            log_stats = epoch % 10 == 0
-            latents, inner_losses, inner_stats = run_inner_loop(
-                model,
-                latents,
-                config.inner_steps,
-                config.inner_lr,
-                rays_o_all,
-                rays_d_all,
-                t_min,
-                t_max,
-                hits_mask,
-                gt_sinogram,
-                num_angles,
-                batch_size_angles,
-                config.num_samples,
-                device,
-                log_stats=log_stats,
-                fitting_mode=config.fitting_mode,
-                gt_image=gt_image,
-                grid_coords=grid_coords,
-                grad_clip_norm=getattr(config, "inner_grad_clip_norm", None),
-                latent_clip_value=getattr(config, "latent_clip_value", None),
-                loss_clip_max=getattr(config, "loss_clip_max", None),
-                check_nan=getattr(config, "check_nan", False),
-            )
-
-            # Log inner loop statistics
-            if log_stats and inner_stats:
-                logger.info(f"Epoch {epoch} Inner Loop Stats:")
-
-                # Group stats by meaningful prefixes
-                def get_group_name(key):
-                    if key.startswith("pred_proj_"):
-                        return "Pred projection"
-                    elif key.startswith("gt_sino_"):
-                        return "GT sinogram"
-                    elif key.startswith("pred_image_"):
-                        return "Pred image"
-                    elif key.startswith("gt_image_"):
-                        return "GT image"
-                    elif key.startswith("latents_grad_"):
-                        return "Latent gradients"
-                    elif key.startswith("latents_"):
-                        return "Latents"
-                    else:
-                        return key.split("_")[0].capitalize()
-
-                stats_groups = {}
-                for key, value in inner_stats.items():
-                    group = get_group_name(key)
-                    if group not in stats_groups:
-                        stats_groups[group] = {}
-                    stats_groups[group][key] = value
-
-                # Log grouped stats
-                for group, group_stats in sorted(stats_groups.items()):
-                    stats_str = ", ".join(
-                        f"{k.split('_')[-1]}={v:.4f}" for k, v in sorted(group_stats.items())
-                    )
-                    logger.info(f"  {group}: {stats_str}")
-
-                # Automatically log all stats to WandB
-                wandb_log_dict = {f"inner/{k}": v for k, v in inner_stats.items()}
-                wandb_log_dict["epoch"] = epoch
-                wandb.log(wandb_log_dict)
-
-        # Outer loop: Update transformer (and latents in joint mode)
+        # --- Single-level optimization: update model parameters directly ---
         outer_optimizer.zero_grad()
-
-        # Handle latents based on training mode
-        if training_mode == "joint":
-            # In joint mode, use latents directly (they're already in the optimizer)
-            latents_final = latents
-        else:
-            # Meta-learning mode: detach latents for outer loop (first-order approximation)
-            latents_final = latents.detach().requires_grad_(True)
 
         fitting_mode = getattr(config, "fitting_mode", "projection")
 
@@ -655,12 +498,8 @@ def train(argv):
                 hits_batch = hits_mask[angle_indices]
                 gt_sino_batch = gt_sinogram[angle_indices]
 
-                # Outer loop forward pass with latents
-                def model_fn_outer(x):
-                    return model(x, latents_final)
-
                 pred_proj = render_parallel_projection(
-                    model_fn_outer,
+                    model,
                     rays_o_batch,
                     rays_d_batch,
                     near=t_min_batch,
@@ -672,12 +511,14 @@ def train(argv):
                     hits_mask=hits_batch,
                 )
                 pred_proj = (pred_proj - sino_center) / sino_half_range
-                loss_outer = compute_loss(pred_proj, gt_sino_batch, is_image=False)
+                loss_outer = compute_loss(
+                    pred_proj, gt_sino_batch.to(pred_proj.dtype), is_image=False
+                )
             elif fitting_mode == "image":
                 # Image fitting outer loss on full grid
-                pred_image_flat = model(grid_coords, latents_final)  # [H*W, 1]
+                pred_image_flat = model(grid_coords)  # [H*W, 1]
                 pred_image = pred_image_flat.reshape(gt_image.shape)  # [1, 1, H, W]
-                loss_outer = compute_loss(pred_image, gt_image, is_image=True)
+                loss_outer = compute_loss(pred_image, gt_image.to(pred_image.dtype), is_image=True)
             else:
                 raise ValueError(f"Unknown fitting_mode: {fitting_mode}")
 
@@ -711,71 +552,45 @@ def train(argv):
                     logger.warning(f"NaN/Inf gradients detected at epoch {epoch}, skipping update")
                     skip_update = True
                     break
-            if training_mode == "joint" and not skip_update and latents.grad is not None:
-                if torch.isnan(latents.grad).any() or torch.isinf(latents.grad).any():
-                    logger.warning(
-                        f"NaN/Inf latent gradients detected at epoch {epoch}, skipping update"
-                    )
-                    skip_update = True
 
         if skip_update:
             outer_optimizer.zero_grad()
             continue
 
-        # Stability: Gradient clipping for model parameters (and latents in joint mode)
+        # Stability: Gradient clipping for model parameters
         grad_clip_norm = getattr(config, "grad_clip_norm", None)
         grad_norm_before_clip = 0.0
         if grad_clip_norm is not None:
-            if training_mode == "joint":
-                # Clip both model and latents together
-                grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(
-                    list(model.parameters()) + [latents], grad_clip_norm
-                )
-            else:
-                grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), grad_clip_norm
-                )
+            grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), grad_clip_norm
+            )
         else:
             # Compute gradient norm even if not clipping
             for p in model.parameters():
                 if p.grad is not None:
                     grad_norm_before_clip += p.grad.norm().item() ** 2
-            if training_mode == "joint" and latents.grad is not None:
-                grad_norm_before_clip += latents.grad.norm().item() ** 2
             grad_norm_before_clip = grad_norm_before_clip**0.5
 
         outer_optimizer.step()
 
-        # Stability: Clip latent values (in joint mode, latents are updated by optimizer)
-        if training_mode == "joint":
-            latent_clip_value = getattr(config, "latent_clip_value", None)
-            if latent_clip_value is not None:
-                with torch.no_grad():
-                    latents.clamp_(-latent_clip_value, latent_clip_value)
-
         # Logging
-        avg_inner_loss = np.mean(inner_losses) if inner_losses else 0.0
         avg_outer_loss = (
             loss_outer_total / grad_accum_steps if grad_accum_steps > 0 else loss_outer.item()
         )
         current_lr = outer_optimizer.param_groups[0]["lr"]
-        current_inner_lr = config.inner_lr
         pbar.set_postfix(
             {
-                "Inner Loss": f"{avg_inner_loss:.6f}",
-                "Outer Loss": f"{avg_outer_loss:.6f}",
+                "Loss": f"{avg_outer_loss:.6f}",
                 "LR": f"{current_lr:.2e}",
-                "Inner LR": f"{current_inner_lr:.3f}",
             }
         )
 
         log_dict = {
-            "train_loss_outer": avg_outer_loss,
+            "train_loss": avg_outer_loss,
             "learning_rate": current_lr,
             "grad_norm": grad_norm_before_clip,
             "epoch": epoch,
         }
-        log_dict["train_loss_inner"] = avg_inner_loss
         wandb.log(log_dict)
 
         # Log model parameter statistics periodically
@@ -815,73 +630,27 @@ def train(argv):
                     "epoch": epoch,
                 }
 
-                # Log latent stats in joint mode
-                if training_mode == "joint":
-                    with torch.no_grad():
-                        latent_norm = joint_latents.norm().item()
-                        latent_mean = joint_latents.mean().item()
-                        latent_std = joint_latents.std().item()
-                    logger.info(
-                        f"  Latents norm: {latent_norm:.4f}, mean: {latent_mean:.4f}, std: {latent_std:.4f}"
-                    )
-                    wandb_log_dict["model/latent_norm"] = latent_norm
-                    wandb_log_dict["model/latent_mean"] = latent_mean
-                    wandb_log_dict["model/latent_std"] = latent_std
-
                 wandb.log(wandb_log_dict)
 
         # Validation
         if (epoch + 1) % config.val_interval == 0:
             model.eval()
 
-            # Get latents for validation based on training mode
-            if training_mode == "joint":
-                # Use persistent latents in joint mode
-                val_latents = joint_latents.detach()
-            else:
-                # Meta-learning mode: run inner loop for validation
-                val_latents = model.init_latents(device=device)
-                val_latents.requires_grad = True
-
-                val_latents, _, _ = run_inner_loop(
-                    model,
-                    val_latents,
-                    config.inner_steps,
-                    config.inner_lr,
-                    rays_o_all,
-                    rays_d_all,
-                    t_min,
-                    t_max,
-                    hits_mask,
-                    gt_sinogram,
-                    num_angles,
-                    batch_size_angles,
-                    config.num_samples,
-                    device,
-                    log_stats=False,
-                    fitting_mode=config.fitting_mode,
-                    gt_image=gt_image,
-                    grid_coords=grid_coords,
-                    grad_clip_norm=getattr(config, "inner_grad_clip_norm", None),
-                    latent_clip_value=getattr(config, "latent_clip_value", None),
-                    loss_clip_max=getattr(config, "loss_clip_max", None),
-                    check_nan=getattr(config, "check_nan", False),
-                )
-                val_latents = val_latents.detach()
-
-            # Reconstruct with final latents (no grad needed here)
             with torch.no_grad():
-                rec_flat = model(grid_coords, val_latents)
+                rec_flat = model(grid_coords)
                 rec_image = rec_flat.reshape(H, W)
+
+                # Ensure shapes match: gt_image is [1, 1, H, W], so use gt_image[0, 0] to get [H, W]
+                gt_image_2d = gt_image[0, 0] if gt_image.dim() == 4 else gt_image[0]
 
                 log_payload = {
                     "val_image": wandb.Image(
                         _normalize_for_logging(rec_image), caption=f"Rec Ep {epoch}"
                     ),
-                    "val_psnr": psnr(rec_image, gt_image[0]).item(),
+                    "val_psnr": psnr(rec_image, gt_image_2d.to(rec_image.dtype)).item(),
                 }
 
-                # Only reconstruct and log sinogram in projection mode
+                # Only reconstruct and log sinogram if we're actually training on projections
                 if getattr(config, "fitting_mode", "projection") == "projection":
                     val_sinogram_list = []
                     val_batch_size = 16
@@ -892,11 +661,8 @@ def train(argv):
                         batch_t_max = t_max[i : i + val_batch_size]
                         batch_hits = hits_mask[i : i + val_batch_size]
 
-                        def model_fn_val_sino(x):
-                            return model(x, val_latents)
-
                         batch_proj = render_parallel_projection(
-                            model_fn_val_sino,
+                            model,
                             batch_rays_o,
                             batch_rays_d,
                             near=batch_t_min,
@@ -909,14 +675,57 @@ def train(argv):
                         )
                         val_sinogram_list.append(batch_proj)
                     rec_sinogram_raw = torch.cat(val_sinogram_list, dim=0)
-                    rec_sinogram = (rec_sinogram_raw - sino_center) / sino_half_range
+
+                    # Compute and visualize sinogram error
+                    sino_error = rec_sinogram_raw - gt_sinogram_raw
+
+                    # Save error plot to disk
+                    plt.figure(figsize=(10, 4))
+                    plt.subplot(1, 3, 1)
+                    plt.imshow(
+                        _normalize_for_logging(gt_sinogram_raw),
+                        cmap="gray",
+                        aspect="auto",
+                    )
+                    plt.title("GT Sinogram")
+                    plt.axis("off")
+
+                    plt.subplot(1, 3, 2)
+                    plt.imshow(
+                        _normalize_for_logging(rec_sinogram_raw),
+                        cmap="gray",
+                        aspect="auto",
+                    )
+                    plt.title("Rec Sinogram")
+                    plt.axis("off")
+
+                    plt.subplot(1, 3, 3)
+                    plt.imshow(
+                        sino_error.detach().cpu().numpy(),
+                        cmap="bwr",
+                        aspect="auto",
+                    )
+                    plt.title("Sino Error (Rec - GT)")
+                    plt.axis("off")
+
+                    plt.tight_layout()
+                    plt.savefig(experiment_dir / f"sino_error_epoch_{epoch + 1}.png")
+                    plt.close()
+
                     log_payload.update(
                         {
                             "val_sinogram": wandb.Image(
                                 _normalize_for_logging(rec_sinogram_raw),
                                 caption=f"Sino Ep {epoch}",
                             ),
+                            "val_sinogram_error": wandb.Image(
+                                _normalize_for_logging(sino_error),
+                                caption=f"Sino Error Ep {epoch}",
+                            ),
                             "proj_psnr": psnr(rec_sinogram_raw, gt_sinogram_raw).item(),
+                            "proj_mse": torch.mean(
+                                (rec_sinogram_raw - gt_sinogram_raw) ** 2
+                            ).item(),
                         }
                     )
 
