@@ -90,7 +90,39 @@ def get_ray_aabb_intersection_2d(rays_o, rays_d, aabb_min, aabb_max):
     return t_min, t_max, hits
 
 
-def render_parallel_projection(model, rays_o, rays_d, near, far, num_samples, rand=False):
+def _normalize_to_aabb(pts, aabb_min, aabb_max):
+    """
+    Normalize 2D points from AABB coordinates to [-1, 1] range expected by grid_sample.
+
+    Args:
+        pts: [..., 2] points in world / AABB coordinates.
+        aabb_min: [2] or broadcastable minimum corner.
+        aabb_max: [2] or broadcastable maximum corner.
+    """
+    # Ensure tensors
+    if not isinstance(aabb_min, torch.Tensor):
+        aabb_min = torch.as_tensor(aabb_min, device=pts.device, dtype=pts.dtype)
+    if not isinstance(aabb_max, torch.Tensor):
+        aabb_max = torch.as_tensor(aabb_max, device=pts.device, dtype=pts.dtype)
+
+    aabb_min = aabb_min.view(*([1] * (pts.ndim - 1)), 2)
+    aabb_max = aabb_max.view(*([1] * (pts.ndim - 1)), 2)
+
+    return 2.0 * (pts - aabb_min) / (aabb_max - aabb_min) - 1.0
+
+
+def render_parallel_projection(
+    model,
+    rays_o,
+    rays_d,
+    near,
+    far,
+    num_samples,
+    aabb_min,
+    aabb_max,
+    rand=False,
+    hits_mask=None,
+):
     """
     Computes the line integral (Radon transform) of the neural field along rays.
 
@@ -103,6 +135,9 @@ def render_parallel_projection(model, rays_o, rays_d, near, far, num_samples, ra
         far: float or [B, P, 1], end of integration.
         num_samples: int, number of integration steps.
         rand: bool, whether to use stratified sampling (jitter).
+        hits_mask: Optional bool mask [B, P] or [B, P, 1]; when provided,
+            only rays with True are sampled/evaluated. Others are skipped and
+            returned as zero.
 
     Returns:
         projections: [B, P] Integrated values.
@@ -110,33 +145,45 @@ def render_parallel_projection(model, rays_o, rays_d, near, far, num_samples, ra
     device = rays_o.device
     B, P, _ = rays_o.shape
 
-    # Convert scalar near/far to tensor if needed, or ensure shape
-    if not isinstance(near, torch.Tensor):
-        near = torch.tensor(near, device=device, dtype=torch.float32)
-    if not isinstance(far, torch.Tensor):
-        far = torch.tensor(far, device=device, dtype=torch.float32)
+    def _ensure_near_far(t, name):
+        """Ensure near/far have shape [B, P, 1] and live on device."""
+        if not isinstance(t, torch.Tensor):
+            t = torch.tensor(t, device=device, dtype=torch.float32)
+        if t.ndim == 0:
+            t = t.expand(B, P, 1)
+        elif t.ndim == 2:
+            t = t.unsqueeze(-1)
+        if t.shape[:2] != (B, P):
+            raise ValueError(f"{name} must broadcast to [B, P, 1]; got {t.shape}")
+        return t
 
-    # Broadcast to [B, P, 1]
-    if near.ndim == 0:
-        near = near.expand(B, P, 1)
-    elif near.ndim == 2:
-        near = near.unsqueeze(-1)  # [B, P] -> [B, P, 1]
+    near = _ensure_near_far(near, "near")
+    far = _ensure_near_far(far, "far")
 
-    if far.ndim == 0:
-        far = far.expand(B, P, 1)
-    elif far.ndim == 2:
-        far = far.unsqueeze(-1)
+    # If a hits mask is provided, render only valid rays to avoid sampling
+    # invalid regions and skip them in training.
+    hits_mask_full = None
+    if hits_mask is not None:
+        hits_mask_full = hits_mask.bool()
+        if hits_mask_full.ndim == 3:
+            hits_mask_full = hits_mask_full.squeeze(-1)
+        if hits_mask_full.shape != (B, P):
+            raise ValueError(f"hits_mask must be [B, P] or [B, P, 1]; got {hits_mask.shape}")
+
+        # Early exit: no valid rays
+        if not hits_mask_full.any():
+            return torch.zeros((B, P), device=device, dtype=torch.float32)
+
+        # Select only valid rays
+        rays_o = rays_o[hits_mask_full].unsqueeze(1)  # [N, 1, 2]
+        rays_d = rays_d[hits_mask_full].unsqueeze(1)  # [N, 1, 2]
+        near = near[hits_mask_full].unsqueeze(1)  # [N, 1, 1]
+        far = far[hits_mask_full].unsqueeze(1)  # [N, 1, 1]
+        B, P, _ = rays_o.shape  # Now B = N_valid, P = 1
 
     # 1. Generate sample steps along the ray
+    steps = torch.linspace(0, 1, num_samples, device=device).reshape(1, 1, num_samples)
 
-    # Create base steps [0, 1, ..., N-1]
-    steps = torch.linspace(0, 1, num_samples, device=device)  # [S]
-
-    # Reshape to [1, 1, S]
-    steps = steps.reshape(1, 1, num_samples)
-
-    # z_vals = near + t * (far - near)
-    # [B, P, 1] + [1, 1, S] * [B, P, 1] -> [B, P, S]
     z_vals = near + steps * (far - near)
 
     # Interval width (average)
@@ -197,15 +244,13 @@ def render_parallel_projection(model, rays_o, rays_d, near, far, num_samples, ra
     else:
         delta = far - near
 
-    # 2. Get sample points
-    # rays_o: [B, P, 1, 2]
-    # rays_d: [B, P, 1, 2]
-    # z_vals: [B, P, S, 1]
     pts = rays_o.unsqueeze(2) + rays_d.unsqueeze(2) * z_vals.unsqueeze(-1)
 
     # pts shape: [B, P, S, 2]
 
-    # 3. Query Model
+    # Optionally normalize coordinates to [-1, 1] using AABB
+    pts = _normalize_to_aabb(pts, aabb_min, aabb_max)
+
     pts_flat = pts.reshape(-1, 2)
     mu_flat = model(pts_flat)
 
@@ -217,8 +262,24 @@ def render_parallel_projection(model, rays_o, rays_d, near, far, num_samples, ra
     if delta.ndim == 3:  # [B, P, 1]
         delta = delta.expand(B, P, num_samples)
 
-    # 4. Integrate
-    # If delta is broadcastable
     projections = torch.sum(mu * delta, dim=-1)
 
-    return projections
+    if hits_mask_full is None:
+        return projections
+
+    # Scatter back into full canvas, zero where hits_mask was False
+    full_proj = torch.zeros(
+        (hits_mask.shape[0], hits_mask.shape[1]), device=device, dtype=projections.dtype
+    )
+    full_proj[hits_mask_full] = projections.squeeze(-1)
+    return full_proj
+
+
+# Try to create a compiled version of the integrator for speed (PyTorch 2.x).
+# Falls back gracefully if torch.compile is unavailable (older PyTorch).
+try:
+    render_parallel_projection = torch.compile(render_parallel_projection)  # type: ignore[attr-defined]
+except (AttributeError, RuntimeError):
+    # AttributeError: torch.compile not present (older PyTorch).
+    # RuntimeError: backend not available / unsupported environment.
+    pass

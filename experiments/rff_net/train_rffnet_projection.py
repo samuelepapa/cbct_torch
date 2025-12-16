@@ -25,6 +25,7 @@ from rendering import (
     get_ray_aabb_intersection_2d,
     render_parallel_projection,
 )
+from utils.logging_utils import setup_logger
 
 FLAGS = flags.FLAGS
 
@@ -41,10 +42,6 @@ def train(argv):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Setup logging before anything else
-    logger = logging.getLogger(__name__)
-    logger.setLevel(logging.INFO)
-
     # Experiment setup
     experiment_root = Path(config.experiment_root)
     experiment_root.mkdir(parents=True, exist_ok=True)
@@ -52,17 +49,9 @@ def train(argv):
     experiment_dir = experiment_root / wandb.run.id
     experiment_dir.mkdir(parents=True, exist_ok=True)
 
-    # Configure logging to file and console
+    # Setup logging
     log_file = experiment_dir / "training.log"
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setLevel(logging.INFO)
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-    file_handler.setFormatter(formatter)
-    console_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
+    logger = setup_logger(__name__, log_file)
 
     logger.info(f"Using device: {device}")
     logger.info(f"Experiment directory: {experiment_dir}")
@@ -156,6 +145,8 @@ def train(argv):
             far=t_max,
             num_samples=config.num_samples_gt,
             rand=False,
+            aabb_min=aabb_min,
+            aabb_max=aabb_max,
         )
     # gt_sinogram: [num_angles, num_det_pixels]
 
@@ -236,6 +227,8 @@ def train(argv):
                 far=b_t_max,
                 num_samples=config.num_samples,
                 rand=True,
+                aabb_min=aabb_min,
+                aabb_max=aabb_max,
             )
 
             loss = loss_fn(pred_proj, b_gt)
@@ -275,6 +268,8 @@ def train(argv):
                         far=batch_t_max,
                         num_samples=config.num_samples,
                         rand=False,
+                        aabb_min=aabb_min,
+                        aabb_max=aabb_max,
                     )
                     val_sinogram_list.append(batch_proj)
                 rec_sinogram = torch.cat(val_sinogram_list, dim=0)
