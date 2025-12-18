@@ -5,11 +5,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
-import wandb
 from absl import app, flags
 from ml_collections.config_flags import config_flags
 from skimage.transform import iradon  # type: ignore
 from tqdm import tqdm
+
+import wandb
 
 # Paths
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
@@ -148,8 +149,6 @@ def train(argv):
     logger = setup_logger(__name__, log_file)
 
     logger.info(f"Using device: {device}")
-    logger.info(f"Experiment directory: {experiment_dir}")
-    logger.info(f"Logging to: {log_file}")
 
     # --- 1. Load Ground Truth Data ---
     full_dataset = get_slice_dataloader(
@@ -179,7 +178,6 @@ def train(argv):
 
     # Detector setup
     H, W = gt_image.shape[-2:]
-    # num_det_pixels = max(H, W)
 
     # Use AABB intersection for rays
     # Use vol_bbox from sample to define physical extent
@@ -200,7 +198,7 @@ def train(argv):
     # Calculate diagonal of actual AABB
     diag = torch.norm(aabb_max - aabb_min).item()
     detector_width = diag * 1.0
-    num_det_pixels = int(np.ceil(np.sqrt(H**2 + W**2)))
+    num_det_pixels = max(H, W)
 
     logger.info(f"Generating Sinogram: {num_angles} angles, {num_det_pixels} pixels")
     logger.info(f"AABB: {aabb_min.cpu().numpy()} to {aabb_max.cpu().numpy()}")
@@ -218,113 +216,18 @@ def train(argv):
     # - order them so near <= far
     # - require finite values
     # - require strictly positive length (far > near)
-    t_near = torch.minimum(t_min, t_max)
-    t_far = torch.maximum(t_min, t_max)
+    # t_near = torch.minimum(t_min, t_max)
+    # t_far = torch.maximum(t_min, t_max)
 
-    is_finite = torch.isfinite(t_near) & torch.isfinite(t_far)
-    has_length = t_far > (t_near + 1e-6)
+    # is_finite = torch.isfinite(t_near) & torch.isfinite(t_far)
+    # has_length = t_far > (t_near + 1e-6)
 
-    valid = hits & is_finite & has_length
+    valid = hits  # & is_finite & has_length
     hits_mask = valid.squeeze(-1)
 
-    # For invalid rays, set a dummy [0, 0] segment; they will be ignored via hits_mask.
-    t_min = torch.where(valid, t_near, torch.zeros_like(t_near))
-    t_max = torch.where(valid, t_far, torch.zeros_like(t_far))
-
-    # --- Debug visualization: sample a larger set of rays and their 2D points ---
-    # Select a set of angles and detector pixels to visualize.
-    num_debug_angles = min(16, num_angles)
-    num_debug_det = min(32, num_det_pixels)
-
-    angle_indices_dbg = torch.linspace(
-        0, num_angles - 1, steps=num_debug_angles, device=device
-    ).long()
-    det_indices_dbg = torch.linspace(
-        0, num_det_pixels - 1, steps=num_debug_det, device=device
-    ).long()
-
-    # Use the same sampling strategy as in render_parallel_projection (deterministic)
-    steps_dbg = torch.linspace(0, 1, config.num_samples_gt, device=device).view(
-        1, 1, config.num_samples_gt
-    )
-
-    ray_points_world = []
-    ray_points_norm = []
-
-    for ai in angle_indices_dbg:
-        for di in det_indices_dbg:
-            if not hits_mask[ai, di]:
-                continue
-
-            ro = rays_o_all[ai, di]  # [2]
-            rd = rays_d_all[ai, di]  # [2]
-            t0 = t_min[ai, di]  # [1]
-            t1 = t_max[ai, di]  # [1]
-
-            # Sample along this ray segment
-            z_vals_dbg = t0 + steps_dbg.squeeze(0).squeeze(0) * (t1 - t0)  # [S]
-            pts_dbg = ro.unsqueeze(0) + rd.unsqueeze(0) * z_vals_dbg.unsqueeze(-1)  # [S, 2]
-
-            # Normalize to model input space [-1, 1]
-            pts_norm_dbg = _normalize_to_aabb(pts_dbg, aabb_min, aabb_max)  # [S, 2]
-
-            ray_points_world.append(pts_dbg.detach().cpu().numpy())
-            ray_points_norm.append(pts_norm_dbg.detach().cpu().numpy())
-
-    if ray_points_world:
-        # Concatenate for scatter plotting
-        world_concat = np.concatenate(ray_points_world, axis=0)  # [N, 2] (y, x)
-        norm_concat = np.concatenate(ray_points_norm, axis=0)  # [N, 2] (x, y) in [-1,1]
-
-        # Optionally subsample if too many points
-        max_points = 5000
-        if world_concat.shape[0] > max_points:
-            idx = np.random.choice(world_concat.shape[0], size=max_points, replace=False)
-            world_concat = world_concat[idx]
-            norm_concat = norm_concat[idx]
-
-        # Plot world-space rays over the GT image and normalized coordinates separately.
-        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-
-        # Left: GT image with ray samples in world coordinates (scatter)
-        axes[0].imshow(
-            gt_image[0, 0].detach().cpu().numpy(),
-            cmap="gray",
-            extent=[
-                aabb_min[1].item(),
-                aabb_max[1].item(),
-                aabb_min[0].item(),
-                aabb_max[0].item(),
-            ],
-            origin="lower",
-        )
-        axes[0].scatter(
-            world_concat[:, 1],
-            world_concat[:, 0],
-            s=4,
-            c="red",
-            alpha=0.4,
-        )
-        axes[0].set_title("Ray samples in world space")
-        axes[0].set_xlim(aabb_min[1].item(), aabb_max[1].item())
-        axes[0].set_ylim(aabb_min[0].item(), aabb_max[0].item())
-
-        # Right: normalized coordinates that go into the model (scatter)
-        axes[1].set_aspect("equal")
-        axes[1].scatter(
-            norm_concat[:, 0],
-            norm_concat[:, 1],
-            s=4,
-            c="blue",
-            alpha=0.4,
-        )
-        axes[1].set_title("Ray samples in normalized space (model input)")
-        axes[1].set_xlim(-1.1, 1.1)
-        axes[1].set_ylim(-1.1, 1.1)
-
-        plt.tight_layout()
-        plt.savefig(experiment_dir / "ray_sampling_debug.png")
-        plt.close(fig)
+    # # For invalid rays, set a dummy [0, 0] segment; they will be ignored via hits_mask.
+    # t_min = torch.where(valid, t_near, torch.zeros_like(t_near))
+    # t_max = torch.where(valid, t_far, torch.zeros_like(t_far))
 
     # Render GT sinogram (raw physical units)
     gt_sinogram = render_parallel_projection(
@@ -340,14 +243,6 @@ def train(argv):
         hits_mask=hits_mask,
     )
 
-    # Affine scaling to roughly map GT sinogram values to [-1, 1]
-    gt_sinogram_raw = gt_sinogram  # keep a copy for logging / PSNR
-    sino_min = gt_sinogram_raw.min()
-    sino_max = gt_sinogram_raw.max()
-    sino_center = 0.5 * (sino_min + sino_max)
-    sino_half_range = 0.5 * (sino_max - sino_min) + 1e-8
-    gt_sinogram = (gt_sinogram_raw - sino_center) / sino_half_range  # ~[-1, 1] target for training
-
     # FBP reconstruction from ground-truth projections
     fbp_gt_image = None
     angles_deg = angles.detach().cpu().numpy() * (180.0 / np.pi)
@@ -355,7 +250,7 @@ def train(argv):
     try:
         # iradon expects sinogram shape [num_detectors, num_angles]
         fbp_gt_np = iradon(
-            gt_sinogram_raw.detach().cpu().numpy().T,
+            gt_sinogram.detach().cpu().numpy().T,
             theta=angles_deg,
             circle=False,
             output_size=max(H, W),
@@ -386,7 +281,7 @@ def train(argv):
     wandb.log({"gt_image": wandb.Image(_normalize_for_logging(gt_image[0, 0]), caption="GT Image")})
     # Log raw sinogram (normalized for visualization), not the scaled training target
     wandb.log(
-        {"gt_sinogram": wandb.Image(_normalize_for_logging(gt_sinogram_raw), caption="GT Sinogram")}
+        {"gt_sinogram": wandb.Image(_normalize_for_logging(gt_sinogram), caption="GT Sinogram")}
     )
     if fbp_gt_image is not None:
         wandb.log(
@@ -399,9 +294,6 @@ def train(argv):
         )
 
     # --- 3. Initialize Model ---
-    # Standard Instant-NGP style hash-encoded MLP (no latents / meta-learning).
-    # Force float32 for both encoding and network to avoid Half/Float mismatches
-    # in tiny-cuda-nn custom kernels.
     model = tcnn.NetworkWithInputEncoding(
         n_input_dims=2,
         n_output_dims=1,
@@ -430,12 +322,8 @@ def train(argv):
     grad_accum_steps = getattr(config, "grad_accum_steps", 1)
 
     logger.info("Starting training...")
-    # Number of angle batches per epoch (for potential scheduling/diagnostics)
-    iter_per_epoch = max(1, num_angles // batch_size_angles)
-    _ = iter_per_epoch
 
     # Pre-generate validation grid for image reconstruction
-    # Grid in world/AABB coordinates
     pixel_size_w = (aabb_max[1].item() - aabb_min[1].item()) / W
     pixel_size_h = (aabb_max[0].item() - aabb_min[0].item()) / H
     y_g, x_g = torch.meshgrid(
@@ -455,8 +343,8 @@ def train(argv):
     )
     grid_coords_world = torch.stack([y_g, x_g], dim=-1).reshape(-1, 2)  # [H*W, 2]
 
-    # Normalize grid to [-1, 1] using the same AABB normalization as ray sampling
-    grid_coords = _normalize_to_aabb(grid_coords_world, aabb_min, aabb_max)
+    # Normalize grid to [0, 1] for Instant NGP model
+    grid_coords = _normalize_to_aabb(grid_coords_world, aabb_min, aabb_max, output_range="01")
 
     num_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Model parameters: {num_params:,}")
@@ -480,16 +368,12 @@ def train(argv):
             for param_group in outer_optimizer.param_groups:
                 param_group["lr"] = config.outer_lr
 
-        # --- Single-level optimization: update model parameters directly ---
         outer_optimizer.zero_grad()
-
         fitting_mode = getattr(config, "fitting_mode", "projection")
-
-        # Gradient accumulation for outer loop
         loss_outer_total = 0.0
+
         for accum_step in range(grad_accum_steps):
             if fitting_mode == "projection":
-                # Sample angles for outer loop
                 angle_indices = torch.randperm(num_angles, device=device)[:batch_size_angles]
                 rays_o_batch = rays_o_all[angle_indices]
                 rays_d_batch = rays_d_all[angle_indices]
@@ -510,54 +394,26 @@ def train(argv):
                     aabb_max=aabb_max,
                     hits_mask=hits_batch,
                 )
-                pred_proj = (pred_proj - sino_center) / sino_half_range
                 loss_outer = compute_loss(
                     pred_proj, gt_sino_batch.to(pred_proj.dtype), is_image=False
                 )
             elif fitting_mode == "image":
-                # Image fitting outer loss on full grid
-                pred_image_flat = model(grid_coords)  # [H*W, 1]
-                pred_image = pred_image_flat.reshape(gt_image.shape)  # [1, 1, H, W]
+                pred_image_flat = model(grid_coords)
+                pred_image = pred_image_flat.reshape(gt_image.shape)
                 loss_outer = compute_loss(pred_image, gt_image.to(pred_image.dtype), is_image=True)
             else:
                 raise ValueError(f"Unknown fitting_mode: {fitting_mode}")
 
-            # Save scalar for logging before any scaling/clamping
             loss_outer_total += loss_outer.detach().item()
 
-            # Stability: Clip loss value
             loss_clip_max = getattr(config, "loss_clip_max", None)
             if loss_clip_max is not None:
                 loss_outer = torch.clamp(loss_outer, max=loss_clip_max)
 
-            # Scale for accumulation
             loss_outer_scaled = loss_outer / grad_accum_steps
-
-            # Backward (only through model weights, not through inner loop)
             retain = accum_step < grad_accum_steps - 1
             loss_outer_scaled.backward(retain_graph=retain)
 
-        # Stability: Clip loss value
-        loss_clip_max = getattr(config, "loss_clip_max", None)
-        if loss_clip_max is not None:
-            # Clamp already-scaled loss (safe for accumulation)
-            loss_outer = torch.clamp(loss_outer, max=loss_clip_max)
-
-        # Stability: Check for NaN/Inf
-        check_nan = getattr(config, "check_nan", False)
-        skip_update = False
-        if check_nan:
-            for p in model.parameters():
-                if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
-                    logger.warning(f"NaN/Inf gradients detected at epoch {epoch}, skipping update")
-                    skip_update = True
-                    break
-
-        if skip_update:
-            outer_optimizer.zero_grad()
-            continue
-
-        # Stability: Gradient clipping for model parameters
         grad_clip_norm = getattr(config, "grad_clip_norm", None)
         grad_norm_before_clip = 0.0
         if grad_clip_norm is not None:
@@ -565,7 +421,6 @@ def train(argv):
                 model.parameters(), grad_clip_norm
             )
         else:
-            # Compute gradient norm even if not clipping
             for p in model.parameters():
                 if p.grad is not None:
                     grad_norm_before_clip += p.grad.norm().item() ** 2
@@ -593,45 +448,6 @@ def train(argv):
         }
         wandb.log(log_dict)
 
-        # Log model parameter statistics periodically
-        if epoch % 10 == 0:
-            with torch.no_grad():
-                # Parameter norms
-                total_norm = 0.0
-                for p in model.parameters():
-                    if p.requires_grad:
-                        total_norm += p.norm().item() ** 2
-                total_norm = total_norm**0.5
-
-                # Gradient norms (after outer loop backward)
-                total_grad_norm = 0.0
-                max_grad = 0.0
-                grad_count = 0
-                for p in model.parameters():
-                    if p.requires_grad and p.grad is not None:
-                        param_grad_norm = p.grad.norm().item()
-                        total_grad_norm += param_grad_norm**2
-                        max_grad = max(max_grad, p.grad.abs().max().item())
-                        grad_count += 1
-
-                if grad_count > 0:
-                    total_grad_norm = total_grad_norm**0.5
-
-                logger.info(f"Epoch {epoch} Model Stats:")
-                logger.info(f"  Total parameter norm: {total_norm:.4f}")
-                logger.info(f"  Total gradient norm: {total_grad_norm:.4f}")
-                logger.info(f"  Max gradient value: {max_grad:.4f}")
-
-                # Log to WandB
-                wandb_log_dict = {
-                    "model/param_norm": total_norm,
-                    "model/grad_norm": total_grad_norm,
-                    "model/max_grad": max_grad,
-                    "epoch": epoch,
-                }
-
-                wandb.log(wandb_log_dict)
-
         # Validation
         if (epoch + 1) % config.val_interval == 0:
             model.eval()
@@ -639,8 +455,6 @@ def train(argv):
             with torch.no_grad():
                 rec_flat = model(grid_coords)
                 rec_image = rec_flat.reshape(H, W)
-
-                # Ensure shapes match: gt_image is [1, 1, H, W], so use gt_image[0, 0] to get [H, W]
                 gt_image_2d = gt_image[0, 0] if gt_image.dim() == 4 else gt_image[0]
 
                 log_payload = {
@@ -650,7 +464,6 @@ def train(argv):
                     "val_psnr": psnr(rec_image, gt_image_2d.to(rec_image.dtype)).item(),
                 }
 
-                # Only reconstruct and log sinogram if we're actually training on projections
                 if getattr(config, "fitting_mode", "projection") == "projection":
                     val_sinogram_list = []
                     val_batch_size = 16
@@ -674,65 +487,28 @@ def train(argv):
                             hits_mask=batch_hits,
                         )
                         val_sinogram_list.append(batch_proj)
-                    rec_sinogram_raw = torch.cat(val_sinogram_list, dim=0)
-
-                    # Compute and visualize sinogram error
-                    sino_error = rec_sinogram_raw - gt_sinogram_raw
-
-                    # Save error plot to disk
-                    plt.figure(figsize=(10, 4))
-                    plt.subplot(1, 3, 1)
-                    plt.imshow(
-                        _normalize_for_logging(gt_sinogram_raw),
-                        cmap="gray",
-                        aspect="auto",
-                    )
-                    plt.title("GT Sinogram")
-                    plt.axis("off")
-
-                    plt.subplot(1, 3, 2)
-                    plt.imshow(
-                        _normalize_for_logging(rec_sinogram_raw),
-                        cmap="gray",
-                        aspect="auto",
-                    )
-                    plt.title("Rec Sinogram")
-                    plt.axis("off")
-
-                    plt.subplot(1, 3, 3)
-                    plt.imshow(
-                        sino_error.detach().cpu().numpy(),
-                        cmap="bwr",
-                        aspect="auto",
-                    )
-                    plt.title("Sino Error (Rec - GT)")
-                    plt.axis("off")
-
-                    plt.tight_layout()
-                    plt.savefig(experiment_dir / f"sino_error_epoch_{epoch + 1}.png")
-                    plt.close()
+                    rec_sinogram = torch.cat(val_sinogram_list, dim=0)
+                    sino_error = rec_sinogram.to(gt_sinogram.dtype) - gt_sinogram
 
                     log_payload.update(
                         {
                             "val_sinogram": wandb.Image(
-                                _normalize_for_logging(rec_sinogram_raw),
+                                _normalize_for_logging(rec_sinogram),
                                 caption=f"Sino Ep {epoch}",
                             ),
                             "val_sinogram_error": wandb.Image(
                                 _normalize_for_logging(sino_error),
                                 caption=f"Sino Error Ep {epoch}",
                             ),
-                            "proj_psnr": psnr(rec_sinogram_raw, gt_sinogram_raw).item(),
-                            "proj_mse": torch.mean(
-                                (rec_sinogram_raw - gt_sinogram_raw) ** 2
-                            ).item(),
+                            "proj_psnr": psnr(rec_sinogram, gt_sinogram).item(),
+                            "proj_mse": torch.mean(sino_error**2).item(),
                         }
                     )
 
                     # FBP of reconstructed sinogram
                     try:
                         fbp_val_np = iradon(
-                            rec_sinogram_raw.detach().cpu().numpy().T,
+                            rec_sinogram.detach().cpu().numpy().T,
                             theta=angles_deg,
                             circle=False,
                             output_size=max(H, W),

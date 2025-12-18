@@ -152,3 +152,4 @@ Thumbs.db
 results/
 *.npy
 data/
+wandb/

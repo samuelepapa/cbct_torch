@@ -23,8 +23,7 @@ class ImageModel(torch.nn.Module):
         orig_shape = x.shape
         x_flat = x.reshape(1, 1, -1, 2)
 
-        # map [0, 1] to [-1, 1]
-        x_flat = 2 * x_flat - 1
+        # Coordinates are already in [-1, 1] range
         out = F.grid_sample(
             self.image, x_flat, align_corners=True, mode="bilinear", padding_mode="zeros"
         )

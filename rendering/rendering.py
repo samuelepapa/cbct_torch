@@ -90,14 +90,15 @@ def get_ray_aabb_intersection_2d(rays_o, rays_d, aabb_min, aabb_max):
     return t_min, t_max, hits
 
 
-def _normalize_to_aabb(pts, aabb_min, aabb_max):
+def _normalize_to_aabb(pts, aabb_min, aabb_max, output_range="01"):
     """
-    Normalize 2D points from AABB coordinates to [-1, 1] range expected by grid_sample.
+    Normalize 2D points from AABB coordinates to specified range.
 
     Args:
         pts: [..., 2] points in world / AABB coordinates.
         aabb_min: [2] or broadcastable minimum corner.
         aabb_max: [2] or broadcastable maximum corner.
+        output_range: "01" for [0, 1] (Instant NGP) or "11" for [-1, 1] (ImageModel/grid_sample).
     """
     # Ensure tensors
     if not isinstance(aabb_min, torch.Tensor):
@@ -108,7 +109,15 @@ def _normalize_to_aabb(pts, aabb_min, aabb_max):
     aabb_min = aabb_min.view(*([1] * (pts.ndim - 1)), 2)
     aabb_max = aabb_max.view(*([1] * (pts.ndim - 1)), 2)
 
-    return (pts - aabb_min) / (aabb_max - aabb_min)
+    # Normalize to [0, 1]
+    normalized = (pts - aabb_min) / (aabb_max - aabb_min + 1e-8)
+
+    if output_range == "11":
+        # Map [0, 1] -> [-1, 1]
+        return 2.0 * normalized - 1.0
+    else:
+        # Keep [0, 1]
+        return normalized
 
 
 def render_parallel_projection(
@@ -179,6 +188,27 @@ def render_parallel_projection(
         rays_d = rays_d[hits_mask_full].unsqueeze(1)  # [N, 1, 2]
         near = near[hits_mask_full].unsqueeze(1)  # [N, 1, 1]
         far = far[hits_mask_full].unsqueeze(1)  # [N, 1, 1]
+
+        # --- CRITICAL NEW FILTERING STEP ---
+        # Filter out rays where the integration range (far - near) is zero or negative.
+        # Note: Use a small epsilon to catch floating point issues.
+        valid_segment = (far - near) > 1e-8
+        valid_segment = valid_segment.squeeze(-1).squeeze(-1)  # [N, 1, 1] -> [N]
+
+        if not valid_segment.any():
+            # If all remaining rays have zero length, return zeros immediately
+            original_shape = (hits_mask.shape[0], hits_mask.shape[1])
+            return torch.zeros(original_shape, device=device, dtype=torch.float32)
+
+        rays_o = rays_o[valid_segment]  # [N_valid_seg, 1, 2]
+        rays_d = rays_d[valid_segment]  # [N_valid_seg, 1, 2]
+        near = near[valid_segment]  # [N_valid_seg, 1, 1]
+        far = far[valid_segment]  # [N_valid_seg, 1, 1]
+        # Also need to update the mask used for scattering back
+        hits_mask_filtered = hits_mask_full.clone()
+        hits_mask_filtered[hits_mask_full.clone()] = valid_segment
+        hits_mask_full = hits_mask_filtered
+        # --- END NEW FILTERING STEP ---
         B, P, _ = rays_o.shape  # Now B = N_valid, P = 1
 
     # 1. Generate sample steps along the ray
@@ -248,11 +278,27 @@ def render_parallel_projection(
 
     # pts shape: [B, P, S, 2]
 
-    # Optionally normalize coordinates to [-1, 1] using AABB
-    pts = _normalize_to_aabb(pts, aabb_min, aabb_max)
+    # Normalize coordinates based on model type:
+    # - ImageModel expects [-1, 1]
+    # - Instant NGP (tcnn) expects [0, 1]
+    # Check model type by class name to avoid circular import
+    model_class_name = model.__class__.__name__
+    is_image_model = model_class_name == "ImageModel"
+    output_range = "11" if is_image_model else "01"
+    pts = _normalize_to_aabb(pts, aabb_min, aabb_max, output_range=output_range)
 
     pts_flat = pts.reshape(-1, 2)
-    mu_flat = model(pts_flat)
+
+    # Only clamp for Instant NGP (which expects [0, 1])
+    if not is_image_model:
+        # Aggressive check:
+        if not torch.isfinite(pts_flat).all():
+            raise RuntimeError("FATAL: NaN/Inf detected in pts_flat before TCNN call.")
+
+        # We should have used the clamped version for this check, but just in case:
+        pts_flat = pts_flat.clamp(min=1e-6, max=1.0 - 1e-6)
+
+    mu_flat = model(pts_flat.to(torch.float32))
 
     if mu_flat.dim() > 1:
         mu_flat = mu_flat.squeeze(-1)
@@ -261,7 +307,9 @@ def render_parallel_projection(
 
     if delta.ndim == 3:  # [B, P, 1]
         delta = delta.expand(B, P, num_samples)
-
+    # Check delta for stability
+    if not torch.isfinite(delta).all():
+        raise RuntimeError("FATAL: NaN/Inf detected in delta (step size).")
     projections = torch.sum(mu * delta, dim=-1)
 
     if hits_mask_full is None:

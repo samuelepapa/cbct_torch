@@ -35,7 +35,7 @@ def get_config():
     # Meta-learning params
     config.inner_steps = 3  # SGD steps for latent optimization
     config.inner_lr = 0.01  # Learning rate for latent SGD
-    config.outer_lr = 0.01  # Learning rate for transformer Adam
+    config.outer_lr = 0.00001  # Learning rate for transformer Adam
     config.warmup_epochs = 50  # Number of epochs for learning rate warmup
 
     # Stability params
