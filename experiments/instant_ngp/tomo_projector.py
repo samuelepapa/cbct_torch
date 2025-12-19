@@ -8,8 +8,20 @@ from torch import Tensor
 def parallel_beam_rays_2d(
     angles: Float[Tensor, "B"],
     detector_coords: Float[Tensor, "D"],
+    origin_shift: Float[Tensor, "B"] | float | None = None,
 ) -> tuple[Float[Tensor, "B D 2"], Float[Tensor, "B D 2"]]:
     """
+    Generate parallel beam rays in 2D.
+
+    Args:
+        angles: [B] tensor of projection angles
+        detector_coords: [D] tensor of detector pixel coordinates
+        origin_shift: Optional shift along ray direction. If provided, origins are shifted
+                     backward by this amount along the ray direction. Can be:
+                     - A scalar (same shift for all angles)
+                     - A tensor [B] (different shift per angle)
+                     - None (no shift, default)
+
     Returns:
         origins:    [B, D, 2]
         directions: [B, D, 2] (unit)
@@ -32,6 +44,17 @@ def parallel_beam_rays_2d(
     # Origins
     o = t[None, :, None] * n  # [B, D, 2]
 
+    # Apply origin shift if provided (shift backward along ray direction)
+    if origin_shift is not None:
+        if isinstance(origin_shift, (int, float)):
+            # Scalar: same shift for all angles
+            shift = torch.tensor(origin_shift, device=o.device, dtype=o.dtype)
+            o = o - shift * d  # Shift backward along ray direction
+        else:
+            # Tensor [B]: different shift per angle
+            shift = origin_shift[:, None, None]  # [B, 1, 1]
+            o = o - shift * d  # Shift backward along ray direction
+
     return o, d
 
 
@@ -49,8 +72,8 @@ def intersect_aabb_2d(
 
     # BBoxes -> [S, 1, 1]
     xmin = bboxes[:, 0, 0][:, None]
-    xmax = bboxes[:, 0, 1][:, None]
-    ymin = bboxes[:, 1, 0][:, None]
+    ymin = bboxes[:, 0, 1][:, None]
+    xmax = bboxes[:, 1, 0][:, None]
     ymax = bboxes[:, 1, 1][:, None]
 
     sx1 = (xmin - ox) / dx
@@ -167,6 +190,11 @@ def get_coordinates(
     z_vals_expanded = z_vals.unsqueeze(-1)  # [S, D, num_samples, 1]
 
     coordinates = origins.unsqueeze(2) + directions.unsqueeze(2) * z_vals_expanded
+
+    # set invalid coordinates to zero
+    coordinates = torch.where(
+        valid.unsqueeze(-1).unsqueeze(-1), coordinates, torch.zeros_like(coordinates)
+    )
     # coordinates: [S, D, num_samples, 2]
 
     # Set coordinates for invalid rays to zero (or keep them as computed)
@@ -174,6 +202,13 @@ def get_coordinates(
     # since the caller can filter using the valid mask if needed
 
     return coordinates
+
+
+# Save original function and create compiled version
+_get_coordinates_original = get_coordinates
+_compiled_get_coordinates = torch.compile(_get_coordinates_original, mode="reduce-overhead")
+# Replace with compiled version for better performance
+get_coordinates = _compiled_get_coordinates
 
 
 def get_coordinates_fixed_step(
@@ -324,11 +359,11 @@ if __name__ == "__main__":
     import matplotlib.pyplot as plt
     import numpy as np
 
-    PLOT = False
+    PLOT = True
 
-    num_projections = 256
-    detector_dim = 256
-    detector_spacing = 0.003
+    num_projections = 10
+    detector_dim = 16
+    detector_spacing = 0.03
 
     angles = torch.linspace(0, np.pi, num_projections, device="cuda", dtype=torch.float32)
 
@@ -350,14 +385,18 @@ if __name__ == "__main__":
 
     bboxes = torch.tensor(
         [
-            [[-0.3, 0.5], [-0.2, 0.5]],
+            [[-0.3, -0.2], [0.3, 0.5]],
         ]
         * num_projections,
         device="cuda",
         dtype=torch.float32,
     )
 
-    origins, directions = parallel_beam_rays_2d(angles, detector_coords)
+    origin_shift = torch.maximum(
+        bboxes[:, 0, 1] - bboxes[:, 0, 0], bboxes[:, 1, 1] - bboxes[:, 1, 0]
+    )
+
+    origins, directions = parallel_beam_rays_2d(angles, detector_coords, origin_shift=2.0)
     s_enter, s_exit, valid = intersect_aabb_2d(origins, directions, bboxes)
 
     enter_coords = origins + s_enter[..., None] * directions
@@ -530,7 +569,8 @@ if __name__ == "__main__":
     stats = profile_get_coordinates(True, 200)
     print_timing_stats("get_coordinates (jitter)", stats)
 
-    compiled_get_coordinates = torch.compile(get_coordinates)
+    # Use original function for compilation test (since get_coordinates is already compiled)
+    compiled_get_coordinates = torch.compile(_get_coordinates_original)
     compiled_get_coordinates_fixed_step = torch.compile(get_coordinates_fixed_step)
 
     def profile_compiled_get_coordinates(jitter: bool, num_samples: int):

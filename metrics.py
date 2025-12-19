@@ -19,7 +19,7 @@ def psnr(pred, gt):
 
     mse = F.mse_loss(pred_flat, gt_flat)
     if mse <= 1e-8:  # avoid division by zero
-        return float("inf")
+        return torch.tensor(float("inf"), device=mse.device, dtype=mse.dtype)
 
     max_val = gt_flat.max()
     return 10 * torch.log10(max_val**2 / mse)
