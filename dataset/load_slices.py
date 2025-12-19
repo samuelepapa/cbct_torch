@@ -28,7 +28,9 @@ class SliceDataset(Dataset):
         normalize: bool = True,
         num_vols: int = 200,
         gray_value_scaling: float = 20.0,
-        rendering_bbox=torch.tensor([[-400, -400, -400], [400, 400, 400]], dtype=torch.float32),
+        rendering_bbox=torch.tensor([[-300, -300, -300], [300, 300, 300]], dtype=torch.float32),
+        num_points: int = 1024,  # Fixed number of points per sample (e.g., 32*32)
+        rng_seed: int = 42,  # Seed for random number generator for reproducibility
     ):
         """
         Args:
@@ -46,6 +48,8 @@ class SliceDataset(Dataset):
         self.normalize = normalize
         self.rendering_bbox = rendering_bbox
         self.gray_value_scaling = gray_value_scaling
+        self.num_points = num_points
+        self.rng_seed = rng_seed
 
         # 1. Gather Paths
         all_volume_paths = sorted(
@@ -130,7 +134,16 @@ class SliceDataset(Dataset):
 
         return vol_idx, remaining_idx
 
-    def __getitem__(self, idx):
+    def _get_slice_data(self, idx):
+        """Helper method to extract slice image and coordinates for a given index.
+
+        Returns:
+            slice_image: numpy array [H, W]
+            coords: numpy array [H, W, 2]
+            vol_bbox: numpy array [2, 3] (normalized)
+            vol_idx: int
+            slice_idx: int
+        """
         vol_idx, slice_idx = self._resolve_global_index(idx)
         volume = self.volumes[vol_idx]
         geo = self.geometries[vol_idx]
@@ -166,12 +179,86 @@ class SliceDataset(Dataset):
         # maxs
         norm_vol_bbox[1] = 2 * vol_bbox[1] / (ref_bbox[1] - ref_bbox[0])
 
+        return slice_image, coords, norm_vol_bbox, vol_idx, slice_idx
+
+    def get_full_slice(self, idx):
+        """Get the full slice (without subsampling) for visualization and metrics.
+
+        Args:
+            idx: Index of the slice in the dataset
+
+        Returns:
+            dict with keys:
+                - 'image': torch.Tensor [H, W] - full slice image
+                - 'coords': torch.Tensor [H, W, 2] - full coordinate grid
+                - 'values': torch.Tensor [H*W] - flattened image values
+                - 'coords_flat': torch.Tensor [H*W, 2] - flattened coordinates
+                - 'vol_bbox': torch.Tensor [2, 3] - normalized volume bounding box
+                - 'slice_idx': int - slice index within the volume
+                - 'patient_idx': int - volume index
+        """
+        slice_image, coords, norm_vol_bbox, vol_idx, slice_idx = self._get_slice_data(idx)
+
+        h, w = slice_image.shape
+
+        # Convert to tensors
+        image_tensor = torch.tensor(slice_image, dtype=torch.float32)  # [H, W]
+        coords_tensor = torch.tensor(coords, dtype=torch.float32)  # [H, W, 2]
+
+        # Flattened versions
+        values_flat = image_tensor.view(-1)  # [H*W]
+        coords_flat = coords_tensor.view(-1, 2)  # [H*W, 2]
+
         return {
-            "image": torch.tensor(slice_image, dtype=torch.float32),
-            "coords": torch.tensor(coords, dtype=torch.float32),
+            "image": image_tensor,  # [H, W]
+            "coords": coords_tensor,  # [H, W, 2]
+            "values": values_flat,  # [H*W]
+            "coords_flat": coords_flat,  # [H*W, 2]
             "vol_bbox": torch.tensor(norm_vol_bbox, dtype=torch.float32),
             "slice_idx": slice_idx,
-            "patient_idx": vol_idx,  # local index in the split
+            "patient_idx": vol_idx,  # kept for compatibility
+            "global_slice_idx": idx,  # global slice index in the dataset (for latent indexing)
+        }
+
+    def __getitem__(self, idx):
+        # Get full slice data
+        slice_image, coords, norm_vol_bbox, vol_idx, slice_idx = self._get_slice_data(idx)
+
+        # Flatten the slice image and coordinates
+        h, w = slice_image.shape
+        total_points = h * w
+
+        # Flatten image and coordinates
+        values_flat = slice_image.flatten()  # [H*W]
+        coords_flat = coords.reshape(-1, 2)  # [H*W, 2]
+
+        # Use a controlled RNG seeded with the sample index for reproducibility
+        # This ensures the same sample always produces the same subsampling
+        rng = np.random.Generator(np.random.PCG64(self.rng_seed + idx))
+
+        # Randomly subsample num_points from the available points
+        if total_points >= self.num_points:
+            # Randomly sample indices without replacement
+            indices = rng.choice(total_points, size=self.num_points, replace=False)
+        else:
+            # If we have fewer points than requested, sample with replacement
+            indices = rng.choice(total_points, size=self.num_points, replace=True)
+
+        # Select subsampled values and coordinates
+        values_sampled = values_flat[indices]  # [num_points]
+        coords_sampled = coords_flat[indices]  # [num_points, 2]
+
+        # Convert to tensors
+        values = torch.tensor(values_sampled, dtype=torch.float32)  # [num_points]
+        coords_flat_tensor = torch.tensor(coords_sampled, dtype=torch.float32)  # [num_points, 2]
+
+        return {
+            "values": values,  # [num_points]
+            "coords": coords_flat_tensor,  # [num_points, 2]
+            "vol_bbox": torch.tensor(norm_vol_bbox, dtype=torch.float32),
+            "slice_idx": slice_idx,
+            "patient_idx": vol_idx,  # local index in the split (kept for compatibility)
+            "global_slice_idx": idx,  # global slice index in the dataset (for latent indexing)
         }
 
     def get_slice_coords(self, geo, slice_idx, axis):
@@ -246,6 +333,8 @@ def get_slice_dataloader(
     stage="train",
     shuffle=True,
     gray_value_scaling=20.0,
+    num_points=1024,  # Fixed number of points per sample
+    rng_seed=42,  # Seed for random number generator
 ):
     dataset = SliceDataset(
         root_dir=root_dir,
@@ -254,6 +343,8 @@ def get_slice_dataloader(
         stage=stage,
         num_vols=num_vols,
         gray_value_scaling=gray_value_scaling,
+        num_points=num_points,
+        rng_seed=rng_seed,
     )
 
     dataloader = DataLoader(
